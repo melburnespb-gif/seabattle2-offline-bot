@@ -28,7 +28,8 @@ jobs:
           yes | sdkmanager --licenses
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug || gradle assembleDebug
+  run: gradle :app:assembleDebug
+
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
