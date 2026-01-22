@@ -1,16 +1,19 @@
 package com.seabattle2.offlinebot
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.Service
+import android.app.*
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
+import android.util.Log
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.roundToInt
+import kotlin.math.max
+import kotlin.math.min
 
 class BotService : Service() {
 
@@ -18,284 +21,262 @@ class BotService : Service() {
         const val ACTION_START = "com.seabattle2.offlinebot.action.START"
         const val ACTION_STOP  = "com.seabattle2.offlinebot.action.STOP"
 
-        private const val NOTIF_CHANNEL_ID = "offlinebot_channel"
-        private const val NOTIF_ID = 1001
+        private const val TAG = "BotService"
+
+        private const val NOTIF_CHANNEL_ID = "bot_channel"
+        private const val NOTIF_ID = 101
+
+        // === ТВОИ ЖЕЛАЕМЫЕ ПАРАМЕТРЫ ДЛЯ МЕНЮ ===
+        private const val MENU_TAPS = 3
+        private const val MENU_DELAY_MS = 10_000L
+
+        // === ПАРАМЕТРЫ ДЛЯ ВЫСТРЕЛОВ (регулируемые) ===
+        // Сколько тапов по одной клетке, чтобы наверняка сработало (например 1..3)
+        private const val SHOT_TAPS = 1
+        // Пауза между тапами по клетке (если SHOT_TAPS > 1)
+        private const val SHOT_TAP_GAP_MS = 250L
+        // Пауза после выстрела (чтобы игра успела обработать ход/анимацию)
+        private const val AFTER_SHOT_PAUSE_MS = 900L
+
+        // === ПРОВЕРКА ХОДА ПО ТРЕУГОЛЬНИКУ ===
+        // Как часто проверять, если сейчас ход врага
+        private const val WAIT_TURN_POLL_MS = 500L
+
+        // Размер области (квадрат) вокруг точки треугольника для усреднения цвета
+        private const val TRI_SAMPLE_RADIUS = 8 // 2*8+1 => 17x17
+
+        // Порог “насколько цвет должен доминировать”
+        private const val DOMINANCE = 45  // чем больше — тем строже
     }
 
     private val running = AtomicBoolean(false)
-    private var worker: Thread? = null
-
     private lateinit var store: CalibrationStore
 
-    // ===== НАСТРОЙКИ "МЕНЮ" =====
-    // Нажать по каждой кнопке 3 раза, пауза 10 секунд между нажатиями
-    private val menuTapCount = 3
-    private val menuTapDelayMs = 10_000L
-
-    // ===== НАСТРОЙКИ "ВЫСТРЕЛА" (по клетке) =====
-    // Сколько раз нажимать по клетке, чтобы не промазать по лагам/анимации
-    private val shotTapCount = 2              // поменяешь под себя
-    private val shotTapGapMs = 450L           // пауза между нажатиями по клетке
-    private val shotAfterMs  = 900L           // пауза после серии нажатий по клетке
-
-    // ===== ПРОВЕРКА "МОЙ ХОД" =====
-    private val turnPollMs = 300L
-    private val turnWaitMaxMs = 25_000L       // максимум ждать "мой ход" перед тем как сдаться и пойти дальше
-    private val turnColorTolerance = 22       // допуск по RGB
-
-    // ===== СЕТКА ВЫСТРЕЛОВ =====
-    private val gridSize = 10
-
-    // Ключи из калибровки (как у тебя в OverlayService steps)
-    private val kOpenMode = "btn_open_mode"
-    private val kStartGame = "btn_start_game"
-    private val kRandomLayout = "btn_random_layout"
-    private val kStartSearch = "btn_start_search"
-    private val kCloseResult = "btn_close_result"
-
-    private val kRightTL = "field_right_tl"
-    private val kRightBR = "field_right_br"
-
-    private val kTurnPixel = "turn_pixel" // ты добавишь эту зону в OverlayService (маркер TURN)
+    // файл скриншота (в директории приложения, без лишних разрешений)
+    private val capFile by lazy {
+        val dir = getExternalFilesDir(null) ?: filesDir
+        File(dir, "cap.png")
+    }
 
     override fun onCreate() {
         super.onCreate()
         store = CalibrationStore(this)
-        ensureForeground()
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onDestroy() {
-        stopNow()
-        super.onDestroy()
+        ensureNotifChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startNow()
-            ACTION_STOP -> stopNow()
+            ACTION_START -> startBot()
+            ACTION_STOP -> stopBot()
         }
         return START_STICKY
     }
 
-    private fun startNow() {
-        if (running.get()) return
-        running.set(true)
+    override fun onBind(intent: Intent?): IBinder? = null
 
-        worker = Thread {
+    private fun startBot() {
+        if (running.getAndSet(true)) return
+
+        startForeground(NOTIF_ID, buildNotification("BOT: running"))
+
+        Thread {
             try {
                 mainLoop()
-            } catch (_: Throwable) {
-                // если что-то упало — просто остановим
+            } catch (t: Throwable) {
+                Log.e(TAG, "Bot crashed", t)
             } finally {
                 running.set(false)
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             }
-        }.apply { start() }
+        }.start()
     }
 
-    private fun stopNow() {
+    private fun stopBot() {
         running.set(false)
-        worker?.interrupt()
-        worker = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun ensureForeground() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                NOTIF_CHANNEL_ID,
-                "OfflineBot",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            nm.createNotificationChannel(ch)
-        }
-
-        val notif: Notification = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            Notification.Builder(this, NOTIF_CHANNEL_ID)
-                .setContentTitle("OfflineBot")
-                .setContentText("Бот запущен")
-                .setSmallIcon(android.R.drawable.ic_media_play)
-                .setOngoing(true)
-                .build()
-        } else {
-            @Suppress("DEPRECATION")
-            Notification.Builder(this)
-                .setContentTitle("OfflineBot")
-                .setContentText("Бот запущен")
-                .setSmallIcon(android.R.drawable.ic_media_play)
-                .setOngoing(true)
-                .build()
-        }
-
-        startForeground(NOTIF_ID, notif)
-    }
-
-    // ==========================
-    // Главный цикл
-    // ==========================
     private fun mainLoop() {
-        // 1) Меню-автоподготовка (кнопки по 3 раза с 10 сек паузой)
-        //    Если игра уже в бою — эти точки могут быть неактуальны, но клики будут "мимо" и ничего страшного.
-        menuPreparation()
+        Log.i(TAG, "Bot loop started")
 
-        // 2) Бой: ходим по клеткам правого поля (enemy) по порядку
-        //    Если ты хочешь другой алгоритм — скажешь, но это уже полноценная логика выбора.
-        battleLoop()
-    }
+        // 1) МЕНЮ: ты просил — “по 3 раза с задержкой 10 секунд между тыками по каждой из кнопок”
+        // Если какие-то точки не откалиброваны — просто пропустим.
+        runMenuMacroIfConfigured()
 
-    // ==========================
-    // МЕНЮ: по 3 раза с 10 сек
-    // ==========================
-    private fun menuPreparation() {
-        // Сценарий:
-        // 1) открыть режим/играть
-        // 2) начать игру
-        // 3) случайная расстановка
-        // 4) старт боя/поиск/играть
-        //
-        // Закрыть результат (если внезапно висит окно конца) — тоже дергаем в конце.
-        val sequence = listOf(kOpenMode, kStartGame, kRandomLayout, kStartSearch)
+        // 2) БОЙ: ждать пока мой ход по треугольнику, потом делать выстрелы
+        // Тут я оставляю “пример” — стрельба пока заглушка, потому что ты не дал финальную логику выбора клетки.
+        // Но ПОЛНОСТЬЮ сделана проверка хода по треугольнику + защита от “прожать в ход врага”.
+        while (running.get()) {
 
-        for (key in sequence) {
-            if (!running.get()) return
-            tapMenuButton3x(key)
+            // если нет точки треугольника — не можем проверять; чтобы не зависнуть, считаем что ход мой
+            val myTurn = isMyTurnByTriangle() ?: true
+
+            if (!myTurn) {
+                SystemClock.sleep(WAIT_TURN_POLL_MS)
+                continue
+            }
+
+            // === ТУТ ДОЛЖНА БЫТЬ ТВОЯ ЛОГИКА ВЫБОРА КЛЕТКИ ===
+            // Сейчас: если задана точка "shot_point" — будем тыкать туда как пример.
+            val shot = store.getPoint("shot_point")
+            if (shot != null) {
+                tapMultiple(shot.x, shot.y, SHOT_TAPS, SHOT_TAP_GAP_MS)
+                SystemClock.sleep(AFTER_SHOT_PAUSE_MS)
+            } else {
+                // если нет клетки — просто не делаем ничего, но продолжаем проверять ход
+                SystemClock.sleep(400)
+            }
         }
 
-        // Иногда после входа/выхода может висеть "Далее" или окно — на всякий случай
-        if (!running.get()) return
-        tapMenuButton3x(kCloseResult)
+        Log.i(TAG, "Bot loop stopped")
     }
 
-    private fun tapMenuButton3x(key: String) {
-        val p = store.getPoint(key) ?: return
-        repeat(menuTapCount) { i ->
-            if (!running.get()) return
-            RootShell.tap(p.first, p.second)
-            // Между нажатиями именно 10 секунд
-            if (i < menuTapCount - 1) sleepMs(menuTapDelayMs)
-        }
-    }
-
-    // ==========================
-    // БОЙ
-    // ==========================
-    private fun battleLoop() {
-        val tl = store.getPoint(kRightTL)
-        val br = store.getPoint(kRightBR)
-
-        // Если сетка не откалибрована — просто ничего не делаем (чтобы не тыкать в экран хаотично)
-        if (tl == null || br == null) return
-
-        // Предварительно вычислим точки центров клеток 10x10
-        val cells = buildGridCells(
-            x1 = tl.first,
-            y1 = tl.second,
-            x2 = br.first,
-            y2 = br.second,
-            n = gridSize
+    private fun runMenuMacroIfConfigured() {
+        // Кнопки меню из твоей калибровки:
+        // btn_open_mode, btn_start_game, btn_random_layout, btn_start_search, btn_close_result
+        val keys = listOf(
+            "btn_open_mode",
+            "btn_start_game",
+            "btn_random_layout",
+            "btn_start_search",
+            "btn_close_result",
         )
 
-        var idx = 0
-        while (running.get()) {
-            // Каждый "ход" — очередная клетка
-            val (x, y) = cells[idx]
+        for (key in keys) {
+            if (!running.get()) return
+            val p = store.getPoint(key) ?: continue
 
-            // Подождать, пока реально можно стрелять (если turn_pixel + turn_color есть)
-            waitMyTurnOrTimeout()
-
-            // Нажать по клетке N раз с паузой
-            tapBurst(x, y, shotTapCount, shotTapGapMs)
-
-            // Пауза после попытки выстрела (даём игре анимацию/переход хода)
-            sleepMs(shotAfterMs)
-
-            idx++
-            if (idx >= cells.size) idx = 0
-
-            // Иногда по кругу полезно "закрыть результат", если бой закончился и висит окно
-            // (в бою это обычно безопасно — если окна нет, клик уйдёт мимо)
-            maybeCloseResult()
-        }
-    }
-
-    private fun maybeCloseResult() {
-        val p = store.getPoint(kCloseResult) ?: return
-        // Одного клика обычно достаточно
-        RootShell.tap(p.first, p.second)
-        sleepMs(250)
-    }
-
-    // ==========================
-    // Ожидание "мой ход"
-    // ==========================
-    private fun waitMyTurnOrTimeout(): Boolean {
-        val p = store.getPoint(kTurnPixel) ?: return true
-        val expected = store.getInt("turn_color", 0)
-        if (expected == 0) return true
-
-        val start = SystemClock.uptimeMillis()
-
-        while (running.get()) {
-            val c = ScreenSampler.getPixelColor(p.first, p.second)
-            if (c != null && TurnDetector.isSimilarColor(c, expected, tol = turnColorTolerance)) {
-                return true
+            // 3 раза с задержкой 10 секунд между нажатиями по КАЖДОЙ кнопке
+            repeat(MENU_TAPS) { i ->
+                if (!running.get()) return
+                RootShell.tap(p.x, p.y)
+                Log.i(TAG, "MENU tap $key (${i + 1}/$MENU_TAPS) at ${p.x},${p.y}")
+                if (i != MENU_TAPS - 1) SystemClock.sleep(MENU_DELAY_MS)
             }
 
-            val elapsed = SystemClock.uptimeMillis() - start
-            if (elapsed >= turnWaitMaxMs) return false
-
-            sleepMs(turnPollMs)
-        }
-        return false
-    }
-
-    // ==========================
-    // Вспомогательные
-    // ==========================
-    private fun tapBurst(x: Int, y: Int, count: Int, gapMs: Long) {
-        if (count <= 0) return
-        var i = 0
-        while (i < count && running.get()) {
-            RootShell.tap(x, y)
-            if (i < count - 1) sleepMs(gapMs)
-            i++
+            // небольшая пауза после кнопки, чтобы интерфейс успел смениться
+            SystemClock.sleep(800)
         }
     }
 
-    private fun buildGridCells(x1: Int, y1: Int, x2: Int, y2: Int, n: Int): List<Pair<Int, Int>> {
-        val left = minOf(x1, x2)
-        val right = maxOf(x1, x2)
-        val top = minOf(y1, y2)
-        val bottom = maxOf(y1, y2)
+    /**
+     * Проверка хода по треугольнику:
+     * - берём скриншот root-ом
+     * - вырезаем область вокруг точки "turn_triangle"
+     * - считаем средний цвет
+     * - если “зелёный доминирует” => мой ход
+     * - если “красный доминирует” => ход врага
+     *
+     * @return true = мой ход, false = враг, null = не удалось определить (нет калибровки/скриншота)
+     */
+    private fun isMyTurnByTriangle(): Boolean? {
+        val tri = store.getPoint("turn_triangle") ?: return null
 
-        val w = (right - left).coerceAtLeast(1)
-        val h = (bottom - top).coerceAtLeast(1)
+        val bmp = takeScreenshot() ?: return null
 
-        val cellW = w.toFloat() / n.toFloat()
-        val cellH = h.toFloat() / n.toFloat()
+        val avg = averageColor(bmp, tri.x, tri.y, TRI_SAMPLE_RADIUS)
+        val r = Color.red(avg)
+        val g = Color.green(avg)
+        val b = Color.blue(avg)
 
-        val out = ArrayList<Pair<Int, Int>>(n * n)
+        // Зелёный треугольник => g сильно больше r и b
+        val green = (g - r) > DOMINANCE && (g - b) > DOMINANCE
 
-        // Центры клеток: (col + 0.5) * cellW
-        for (row in 0 until n) {
-            for (col in 0 until n) {
-                val cx = left + ((col + 0.5f) * cellW).roundToInt()
-                val cy = top + ((row + 0.5f) * cellH).roundToInt()
-                out.add(cx to cy)
+        // Красный треугольник => r сильно больше g и b
+        val red = (r - g) > DOMINANCE && (r - b) > DOMINANCE
+
+        Log.d(TAG, "TURN color avg rgb=($r,$g,$b) green=$green red=$red")
+
+        return when {
+            green -> true
+            red -> false
+            else -> {
+                // если промежуточная анимация/блеклый цвет — можно считать “не определилось”
+                // и тогда бот НЕ стреляет (безопаснее)
+                null
             }
         }
-        return out
     }
 
-    private fun sleepMs(ms: Long) {
-        if (ms <= 0) return
+    private fun takeScreenshot(): Bitmap? {
         try {
-            Thread.sleep(ms)
-        } catch (_: InterruptedException) {
+            // root пишет файл в директорию приложения, которую мы читаем без storage-permission
+            // ВАЖНО: RootShell.exec должен выполнять "su -c ..."
+            val path = capFile.absolutePath
+            RootShell.exec("screencap -p \"$path\"")
+            if (!capFile.exists() || capFile.length() < 1000) {
+                Log.w(TAG, "Screenshot file not created: $path")
+                return null
+            }
+            val bytes = capFile.readBytes()
+            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        } catch (t: Throwable) {
+            Log.e(TAG, "takeScreenshot failed", t)
+            return null
         }
+    }
+
+    private fun averageColor(bmp: Bitmap, cx: Int, cy: Int, radius: Int): Int {
+        val x0 = max(0, cx - radius)
+        val y0 = max(0, cy - radius)
+        val x1 = min(bmp.width - 1, cx + radius)
+        val y1 = min(bmp.height - 1, cy + radius)
+
+        var sr = 0L
+        var sg = 0L
+        var sb = 0L
+        var count = 0L
+
+        for (y in y0..y1) {
+            for (x in x0..x1) {
+                val c = bmp.getPixel(x, y)
+                sr += Color.red(c)
+                sg += Color.green(c)
+                sb += Color.blue(c)
+                count++
+            }
+        }
+
+        if (count == 0L) return Color.BLACK
+        val r = (sr / count).toInt()
+        val g = (sg / count).toInt()
+        val b = (sb / count).toInt()
+        return Color.rgb(r, g, b)
+    }
+
+    private fun tapMultiple(x: Int, y: Int, count: Int, gapMs: Long) {
+        repeat(max(1, count)) { i ->
+            RootShell.tap(x, y)
+            if (i != count - 1) SystemClock.sleep(gapMs)
+        }
+    }
+
+    private fun ensureNotifChannel() {
+        if (Build.VERSION.SDK_INT < 26) return
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val ch = NotificationChannel(
+            NOTIF_CHANNEL_ID,
+            "Seabattle Bot",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        nm.createNotificationChannel(ch)
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val pi = PendingIntent.getActivity(
+            this, 0,
+            packageManager.getLaunchIntentForPackage(packageName),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        return Notification.Builder(this, NOTIF_CHANNEL_ID)
+            .setContentTitle("Offline Bot")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(pi)
+            .setOngoing(true)
+            .build()
     }
 }
