@@ -5,8 +5,12 @@ import android.content.Intent
 import android.graphics.PixelFormat
 import android.os.IBinder
 import android.os.SystemClock
-import android.view.*
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
 import android.widget.TextView
+import kotlin.math.abs
 
 class OverlayService : Service() {
 
@@ -93,7 +97,7 @@ class OverlayService : Service() {
                 MotionEvent.ACTION_MOVE -> {
                     val dx = ev.rawX.toInt() - downX
                     val dy = ev.rawY.toInt() - downY
-                    if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) moved = true
+                    if (abs(dx) > 8 || abs(dy) > 8) moved = true
                     params.x = startX + dx
                     params.y = startY + dy
                     wm.updateViewLayout(button, params)
@@ -121,7 +125,10 @@ class OverlayService : Service() {
 
     private fun toggleRun() {
         isRunning = !isRunning
-        // пока просто переключатель. Дальше сюда подключим “цикл игры”.
+        val intent = Intent(this, BotService::class.java).apply {
+            action = if (isRunning) BotService.ACTION_START else BotService.ACTION_STOP
+        }
+        startService(intent)
     }
 
     private fun toggleCalib() {
@@ -186,6 +193,9 @@ class OverlayService : Service() {
 
                 val (key, _) = steps[stepIndex]
                 store.savePoint(key, x, y)
+
+                // ✅ прокидываем тап в игру (root)
+                RootShell.tap(x, y)
 
                 stepIndex++
                 val tv = hintView as? TextView
