@@ -6,43 +6,53 @@ import android.graphics.PixelFormat
 import android.os.IBinder
 import android.os.SystemClock
 import android.view.Gravity
-import android.view.MotionEvent
-import android.view.View
 import android.view.WindowManager
+import android.widget.LinearLayout
 import android.widget.TextView
-import kotlin.math.abs
 
 class OverlayService : Service() {
 
     private lateinit var wm: WindowManager
+    private lateinit var store: CalibrationStore
 
-    private var botView: View? = null
-    private var captureView: View? = null
-    private var hintView: View? = null
+    private var panelView: LinearLayout? = null
+    private var botBtn: TextView? = null
+    private var calibBtn: TextView? = null
 
     private var isRunning = false
     private var isCalibrating = false
 
-    private val steps = listOf(
-        "btn_open_mode" to "Кнопка: открыть выбор режима/игры (например ИГРАТЬ)",
-        "btn_start_game" to "Кнопка: начать игру (в меню режима)",
-        "btn_random_layout" to "Кнопка: случайная расстановка кораблей",
-        "btn_start_search" to "Кнопка: начать бой/поиск бота",
-        "btn_close_result" to "Кнопка: закрыть окно победы/поражения (Далее)",
-        "field_left_tl" to "ЛЕВОЕ поле: верхний левый угол (край сетки)",
-        "field_left_br" to "ЛЕВОЕ поле: нижний правый угол (край сетки)",
-        "field_right_tl" to "ПРАВОЕ поле: верхний левый угол (край сетки)",
-        "field_right_br" to "ПРАВОЕ поле: нижний правый угол (край сетки)"
-    )
-    private var stepIndex = 0
+    private val zones = listOf(
+        // Меню-кнопки (важны для тройного тапа)
+        "btn_open_mode" to "OPEN",
+        "btn_start_game" to "START",
+        "btn_random_layout" to "RAND",
+        "btn_start_search" to "FIGHT",
+        "btn_close_result" to "NEXT",
 
-    private lateinit var store: CalibrationStore
+        // Поля (если нужно для будущего)
+        "field_left_tl" to "L_TL",
+        "field_left_br" to "L_BR",
+        "field_right_tl" to "R_TL",
+        "field_right_br" to "R_BR",
+    )
+
+    private data class Marker(
+        val key: String,
+        val label: String,
+        var x: Int,
+        var y: Int,
+        var view: ZoneMarkerView? = null,
+        var params: WindowManager.LayoutParams? = null
+    )
+
+    private val markers = mutableListOf<Marker>()
 
     override fun onCreate() {
         super.onCreate()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         store = CalibrationStore(this)
-        showBotButton()
+        showPanel()
     }
 
     override fun onDestroy() {
@@ -52,75 +62,59 @@ class OverlayService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun showBotButton() {
-        if (botView != null) return
+    private fun showPanel() {
+        if (panelView != null) return
 
-        val button = TextView(this).apply {
-            text = "BOT"
-            textSize = 16f
-            setPadding(26, 18, 26, 18)
-            setBackgroundColor(0xAA222222.toInt())
-            setTextColor(0xFFFFFFFF.toInt())
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xAA111111.toInt())
+            setPadding(18, 14, 18, 14)
         }
+
+        fun makeBtn(text: String): TextView =
+            TextView(this).apply {
+                this.text = text
+                textSize = 16f
+                setPadding(26, 18, 26, 18)
+                setBackgroundColor(0xAA222222.toInt())
+                setTextColor(0xFFFFFFFF.toInt())
+            }
+
+        val bot = makeBtn("BOT")
+        val calib = makeBtn("CALIB")
+
+        bot.setOnClickListener {
+            toggleRun()
+            bot.text = if (isRunning) "ON" else "BOT"
+        }
+
+        calib.setOnClickListener {
+            toggleCalib()
+            calib.text = if (isCalibrating) "SAVE" else "CALIB"
+        }
+
+        panel.addView(bot)
+        panel.addView(calib)
 
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, // не забираем фокус, игра остаётся живой
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 80
-            y = 260
+            x = 60
+            y = 240
         }
 
-        // Перетаскивание + клик/лонгклик
-        var downX = 0
-        var downY = 0
-        var startX = 0
-        var startY = 0
-        var downTime = 0L
-        var moved = false
+        // простое перетаскивание всего панеля
+        panel.setOnTouchListener(DragMoveTouch(wm, panel, params))
 
-        button.setOnTouchListener { _, ev ->
-            when (ev.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    downTime = SystemClock.uptimeMillis()
-                    moved = false
-                    downX = ev.rawX.toInt()
-                    downY = ev.rawY.toInt()
-                    startX = params.x
-                    startY = params.y
-                    true
-                }
-                MotionEvent.ACTION_MOVE -> {
-                    val dx = ev.rawX.toInt() - downX
-                    val dy = ev.rawY.toInt() - downY
-                    if (abs(dx) > 8 || abs(dy) > 8) moved = true
-                    params.x = startX + dx
-                    params.y = startY + dy
-                    wm.updateViewLayout(button, params)
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    val press = SystemClock.uptimeMillis() - downTime
-                    if (!moved) {
-                        if (press > 600) {
-                            toggleCalib()
-                        } else {
-                            toggleRun()
-                            button.text = if (isRunning) "ON" else "BOT"
-                        }
-                    }
-                    true
-                }
-                else -> false
-            }
-        }
-
-        wm.addView(button, params)
-        botView = button
+        wm.addView(panel, params)
+        panelView = panel
+        botBtn = bot
+        calibBtn = calib
     }
 
     private fun toggleRun() {
@@ -132,111 +126,135 @@ class OverlayService : Service() {
     }
 
     private fun toggleCalib() {
-        if (!isCalibrating) {
-            isCalibrating = true
-            stepIndex = 0
-            showHint()
-            showCaptureOverlay()
+        isCalibrating = !isCalibrating
+        if (isCalibrating) {
+            showMarkers()
         } else {
-            stopCalib()
+            saveMarkers()
+            hideMarkers()
         }
     }
 
-    private fun stopCalib() {
-        isCalibrating = false
-        removeCaptureOverlay()
-        removeHint()
+    private fun showMarkers() {
+        if (markers.isNotEmpty()) return
+
+        // стартовые позиции: если есть сохранённые — берём их, иначе раскидаем “лесенкой”
+        var startX = 80
+        var startY = 420
+        for ((key, label) in zones) {
+            val saved = store.getPoint(key)
+            val (x, y) = saved ?: (startX to startY).also {
+                startY += 170
+                if (startY > 1400) { startY = 420; startX += 190 }
+            }
+
+            val marker = Marker(key, label, x, y)
+            addMarker(marker)
+            markers.add(marker)
+        }
     }
 
-    private fun showHint() {
-        if (hintView != null) return
-
-        val tv = TextView(this).apply {
-            textSize = 14f
-            setPadding(22, 16, 22, 16)
-            setBackgroundColor(0xAA000000.toInt())
-            setTextColor(0xFFFFFFFF.toInt())
-        }
+    private fun addMarker(m: Marker) {
+        val v = ZoneMarkerView(
+            this,
+            label = m.label,
+            onMove = { dx, dy ->
+                val p = m.params ?: return@ZoneMarkerView
+                p.x += dx
+                p.y += dy
+                m.x = p.x
+                m.y = p.y
+                wm.updateViewLayout(v, p)
+            },
+            onClick = {
+                // быстрый тест: тап в эту точку (если хочешь проверить)
+                RootShell.tap(m.x + 80, m.y + 80) // центр маркера
+            }
+        )
 
         val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = 40
-        }
-
-        updateHintText(tv)
-        wm.addView(tv, p)
-        hintView = tv
-    }
-
-    private fun updateHintText(tv: TextView) {
-        val (key, title) = steps[stepIndex]
-        tv.text = "CALIB ${stepIndex + 1}/${steps.size}\n$title\n(тапни по месту на экране)\n$key"
-    }
-
-    private fun showCaptureOverlay() {
-        if (captureView != null) return
-
-        val v = View(this)
-        v.setBackgroundColor(0x22000000) // слегка затемним
-
-        v.setOnTouchListener { _, ev ->
-            if (!isCalibrating) return@setOnTouchListener false
-            if (ev.action == MotionEvent.ACTION_DOWN) {
-                val x = ev.rawX.toInt()
-                val y = ev.rawY.toInt()
-
-                val (key, _) = steps[stepIndex]
-                store.savePoint(key, x, y)
-
-                // ✅ прокидываем тап в игру (root)
-                RootShell.tap(x, y)
-
-                stepIndex++
-                val tv = hintView as? TextView
-                if (stepIndex >= steps.size) {
-                    tv?.text = "CALIB DONE ✅\nДолгий тап по BOT — выйти"
-                } else {
-                    tv?.let { updateHintText(it) }
-                }
-                return@setOnTouchListener true
-            }
-            true
-        }
-
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, // важно: не блокирует игру вне самого маркера
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
+            x = m.x
+            y = m.y
         }
 
-        wm.addView(v, params)
-        captureView = v
+        wm.addView(v, p)
+        m.view = v
+        m.params = p
     }
 
-    private fun removeCaptureOverlay() {
-        captureView?.let { wm.removeView(it) }
-        captureView = null
+    private fun saveMarkers() {
+        // сохраняем центр каждого маркера как точку нажатия
+        for (m in markers) {
+            val tapX = m.x + 80
+            val tapY = m.y + 80
+            store.savePoint(m.key, tapX, tapY)
+        }
     }
 
-    private fun removeHint() {
-        hintView?.let { wm.removeView(it) }
-        hintView = null
+    private fun hideMarkers() {
+        for (m in markers) {
+            m.view?.let { wm.removeView(it) }
+        }
+        markers.clear()
     }
 
     private fun removeAll() {
-        removeCaptureOverlay()
-        removeHint()
-        botView?.let { wm.removeView(it) }
-        botView = null
+        try { hideMarkers() } catch (_: Throwable) {}
+        panelView?.let { wm.removeView(it) }
+        panelView = null
+        botBtn = null
+        calibBtn = null
+    }
+
+    /**
+     * Перетаскивание панели (как твой старый код, только вынесено)
+     */
+    private class DragMoveTouch(
+        private val wm: WindowManager,
+        private val view: android.view.View,
+        private val params: WindowManager.LayoutParams
+    ) : android.view.View.OnTouchListener {
+
+        private var downX = 0
+        private var downY = 0
+        private var startX = 0
+        private var startY = 0
+        private var downTime = 0L
+        private var moved = false
+
+        override fun onTouch(v: android.view.View, ev: android.view.MotionEvent): Boolean {
+            when (ev.action) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    downTime = SystemClock.uptimeMillis()
+                    moved = false
+                    downX = ev.rawX.toInt()
+                    downY = ev.rawY.toInt()
+                    startX = params.x
+                    startY = params.y
+                    return true
+                }
+                android.view.MotionEvent.ACTION_MOVE -> {
+                    val dx = ev.rawX.toInt() - downX
+                    val dy = ev.rawY.toInt() - downY
+                    if (kotlin.math.abs(dx) > 8 || kotlin.math.abs(dy) > 8) moved = true
+                    params.x = startX + dx
+                    params.y = startY + dy
+                    wm.updateViewLayout(view, params)
+                    return true
+                }
+                android.view.MotionEvent.ACTION_UP -> {
+                    // клик по панели нам не нужен
+                    return true
+                }
+            }
+            return false
+        }
     }
 }
