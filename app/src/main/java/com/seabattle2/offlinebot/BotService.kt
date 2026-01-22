@@ -43,6 +43,8 @@ class BotService : Service() {
             val wake = acquireWakeLock()
             try {
                 loop()
+            } catch (t: Throwable) {
+                updateNotif("Crash: ${t.javaClass.simpleName}")
             } finally {
                 wake?.release()
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -61,8 +63,9 @@ class BotService : Service() {
     private fun loop() {
         val store = CalibrationStore(this)
 
-        fun p(key: String): Pair<Int, Int> =
-            store.loadPoint(key) ?: throw IllegalStateException("Need calibration: $key")
+        fun p(key: String): Pair<Int, Int> {
+            return store.loadPoint(key) ?: throw IllegalStateException("Need calibration: $key")
+        }
 
         // кнопки
         val btnOpen = p("btn_open_mode")
@@ -71,7 +74,7 @@ class BotService : Service() {
         val btnSearch = p("btn_start_search")
         val btnClose = p("btn_close_result")
 
-        // поля
+        // поля (углы)
         val left = FieldRect(p("field_left_tl"), p("field_left_br"))
         val right = FieldRect(p("field_right_tl"), p("field_right_br"))
 
@@ -91,8 +94,13 @@ class BotService : Service() {
             var shots = 0
             var hits = 0
 
-            // определить целевое поле (враг) по “белизне”
-            val bm0 = ScreenIO.screenshot(this) ?: run { humanDelay(); continue }
+            // Скриншот для определения целевого поля
+            val bm0 = ScreenIO.screenshot(this)
+            if (bm0 == null) {
+                humanDelay()
+                continue
+            }
+
             val wLeft = Vision.whitenessRatio(
                 bm0,
                 Vision.Rect(left.tl.first, left.tl.second, left.br.first, left.br.second)
@@ -114,7 +122,9 @@ class BotService : Service() {
                 shots++
                 humanDelay(650, 1100)
 
-                val bm = ScreenIO.screenshot(this) ?: continue
+                val bm = ScreenIO.screenshot(this)
+                if (bm == null) continue
+
                 val st = Vision.cellState(bm, cell.sx, cell.sy)
                 board[mv.y][mv.x] = st
                 if (st == CellState.HIT) hits++
@@ -124,7 +134,6 @@ class BotService : Service() {
                     break
                 }
 
-                // Доп. эвристика: если игра показала окно результата — закрываем
                 if (resultLikelyShown(bm, btnClose)) {
                     updateNotif("Result window (hits=$hits, shots=$shots)")
                     break
@@ -138,7 +147,6 @@ class BotService : Service() {
     }
 
     private fun resultLikelyShown(bm: android.graphics.Bitmap, btn: Pair<Int, Int>): Boolean {
-        // эвристика по контрасту/яркости вокруг кнопки "Далее"
         val (x, y) = btn
         val r = 22
         val l = (x - r).coerceIn(0, bm.width - 1)
@@ -161,7 +169,6 @@ class BotService : Service() {
         if (n == 0) return false
         val mean = sum.toDouble() / n
         val varr = (sum2.toDouble() / n) - mean * mean
-
         return mean < 210 && varr > 200.0
     }
 
@@ -203,6 +210,8 @@ class BotService : Service() {
             pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SeaBattleBot::wakelock").apply {
                 acquire(10 * 60 * 1000L)
             }
-        } catch (_: Throwable) { null }
+        } catch (_: Throwable) {
+            null
+        }
     }
 }
