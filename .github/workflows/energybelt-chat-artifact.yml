@@ -1,0 +1,27 @@
+name: EnergyBelt chat artifact handoff
+
+on:
+  push:
+    paths:
+      - .github/workflows/energybelt-chat-artifact.yml
+
+jobs:
+  handoff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_URL="$(sed -n "s/^[[:space:]]*APK_URL: '\(.*\)'[[:space:]]*$/\1/p" .github/workflows/energybelt-handoff.yml | head -n1)"
+          test -n "$APK_URL"
+          curl -fL --retry 5 --retry-all-errors "$APK_URL" -o EnergyBelt.apk
+          test "$(stat -c %s EnergyBelt.apk)" = "150278190"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EnergyBelt-apk
+          path: EnergyBelt.apk
+          if-no-files-found: error
+          retention-days: 1
